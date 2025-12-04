@@ -82,41 +82,69 @@ if __name__ == "__main__":
     model.eval()  # 切换到评估模式
     print(f"✅ 模型加载完成：{MODEL_PATH}")
 
-    # -------------------------- 3. 滚动预测（不使用测试集真实数据）--------------------------
+    # -------------------------- 3. 真正的滚动预测（避免数据泄露）--------------------------
     all_predictions = []
     all_actuals = []
     all_times = []
 
     with torch.no_grad():  # 关闭梯度计算
-        for i, (batch_x, batch_y) in enumerate(test_loader):
-            # 初始输入：真实历史数据
-            current_input = batch_x  # shape: [1, LOOK_BACK, 1]
-            
-            # 一次性预测未来PREDICT_STEPS步（全程不使用测试集真实数据）
+        # 初始输入：仅使用第一个样本的真实历史数据
+        initial_input, _ = test_dataset[0]  # shape: [LOOK_BACK, 1]
+        current_input = initial_input.unsqueeze(0)  # shape: [1, LOOK_BACK, 1]
+        
+        # 获取测试集全部真实值（用于对比，不用于预测）
+        all_test_actuals = test_dataset.scaled_data[LOOK_BACK:].numpy()  # 去掉初始LOOK_BACK步
+        total_steps_to_predict = len(all_test_actuals)
+        
+        print(f"测试集总长度：{total_steps_to_predict} 步（去除初始{LOOK_BACK}步历史窗口）")
+        
+        # 滚动预测：每次预测PREDICT_STEPS步，然后用预测值更新输入窗口
+        predicted_steps = 0
+        while predicted_steps < total_steps_to_predict:
+            # 一次性预测未来PREDICT_STEPS步
             pred = model(current_input)  # shape: [1, PREDICT_STEPS]
+            pred_np = pred.numpy()[0]  # shape: [PREDICT_STEPS]
             
-            # 存储预测结果和真实值（反归一化）
-            pred_denorm = test_dataset.inverse_transform_temp(pred).numpy()[0]
-            actual_denorm = test_dataset.inverse_transform_temp(batch_y).numpy()[0]
+            steps_this_round = min(PREDICT_STEPS, total_steps_to_predict - predicted_steps)
             
-            all_predictions.extend(pred_denorm)
-            all_actuals.extend(actual_denorm)
+            # 存储预测结果（归一化值，后续统一反归一化）
+            all_predictions.extend(pred_np[:steps_this_round])
             
-            # 记录时间点（匹配数据的实际采样频率，小时级）
-            start_time = test_dataset.time_index.iloc[i]
-            time_steps = pd.date_range(start=start_time, periods=PREDICT_STEPS, freq='H')  # 小时级采样
-            all_times.extend(time_steps)
+            if steps_this_round < LOOK_BACK:
+                new_input = torch.cat([
+                    current_input[:, steps_this_round:, :],
+                    torch.tensor(pred_np[:steps_this_round]).unsqueeze(0).unsqueeze(2)  # 追加预测值
+                ], dim=1)
+            else:
+                new_input = torch.tensor(pred_np[-LOOK_BACK:]).unsqueeze(0).unsqueeze(2)
+            
+            current_input = new_input  # 更新为新输入
+            predicted_steps += steps_this_round
             
             # 打印进度
-            if (i + 1) % 10 == 0 or i + 1 == len(test_loader):
-                print(f"已完成 {i + 1}/{len(test_loader)} 个测试样本预测")
+            if predicted_steps % (PREDICT_STEPS * 10) == 0 or predicted_steps >= total_steps_to_predict:
+                print(f"已完成 {predicted_steps}/{total_steps_to_predict} 步预测")
+        
+        # 获取对应的真实值（反归一化）
+        all_actuals = test_dataset.inverse_transform_temp(
+            torch.tensor(all_test_actuals[:predicted_steps, test_dataset.target_idx])
+        ).numpy()
+        
+        # 反归一化预测值
+        all_predictions = test_dataset.inverse_transform_temp(
+            torch.tensor(all_predictions)
+        ).numpy()
+        
+        # 生成对应的时间索引
+        start_time = test_dataset.df[test_dataset.time_col].iloc[LOOK_BACK]  # 预测起始时间
+        all_times = pd.date_range(start=start_time, periods=predicted_steps, freq='H')
 
-    # 去重时间（处理滚动预测的重叠时间点）
+    # 构建结果DataFrame（无重复时间点）
     results_df = pd.DataFrame({
         'time': all_times,
         'predicted': all_predictions,
         'actual': all_actuals
-    }).drop_duplicates(subset='time').sort_values('time').reset_index(drop=True)
+    })
 
     # -------------------------- 4. 计算评估指标 --------------------------
     mse = np.mean((results_df['predicted'] - results_df['actual']) **2)

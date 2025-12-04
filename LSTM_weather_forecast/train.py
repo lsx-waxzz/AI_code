@@ -12,7 +12,7 @@ if __name__ == "__main__":
     LOOK_BACK = 10          # 回看步数（历史窗口）
     PREDICT_STEPS = 10      # 单次预测步数（一次性输出10步）
     BATCH_SIZE = 32         # 批次大小
-    EPOCHS = 50             # 训练轮数
+    EPOCHS = 10             # 训练轮数
     LEARNING_RATE = 0.001   # 学习率
     SAVE_PATH = "./10step_lstm_single_feature_model.pth"  # 模型保存路径
 
